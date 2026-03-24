@@ -1,20 +1,33 @@
 # WhatsApp Channel for Claude Code
 
-A custom [Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels) plugin that adds WhatsApp as a messaging channel, using [Baileys](https://github.com/WhiskeySockets/Baileys) (WhatsApp Web Multi-Device protocol).
+A custom [Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels) plugin that adds WhatsApp as a messaging channel, using [Baileys](https://github.com/WhiskeySockets/Baileys) v7 (WhatsApp Web Multi-Device protocol).
 
-> **Note:** This is a personal project that I've open-sourced for the community. It works for my setup and I'm sharing it as-is. No support or maintenance is guaranteed — feel free to fork and adapt to your needs. PRs are welcome.
+> **Note:** This is a personal project that I've open-sourced for the community. It works for my 24/7 setup and I'm sharing it as-is. PRs are welcome.
 
 ## How it works
 
 ```
 WhatsApp (phone)
-    ↕ Baileys v7 (Multi-Device protocol)
-server.cjs (MCP server with channel capability)
+    ↕ Baileys v7.0.0-rc.9 (Multi-Device protocol)
+server.cjs (MCP server with channel + permission relay capabilities)
     ↕ notifications/claude/channel
 Claude Code (receives and responds to WhatsApp messages)
 ```
 
 The plugin runs as an MCP server that connects to WhatsApp via Baileys, receives incoming messages, and pushes them to Claude Code as channel notifications. Claude can reply using the `reply` tool.
+
+## Features (v0.0.3)
+
+- **Production-grade stability** — connection patterns based on [OpenClaw](https://github.com/openclaw/openclaw)'s proven WhatsApp gateway
+- **515 is normal** — WhatsApp restart requests are handled gracefully (reconnect in 2s, not crash)
+- **Never crashes the process** — only stops on 440 (conflict) or 401 (logout); everything else reconnects
+- **Exponential backoff with jitter** — factor 1.8, jitter 25%, max 30s, reset after healthy period
+- **Watchdog** — detects stale connections (30min timeout) and forces reconnect
+- **Credential backup** — auto-backup before each save, auto-restore if corrupted
+- **Permission relay** — approve Claude Code tool use from your phone ("yes xxxxx" / "no xxxxx")
+- **getMessage handler** — required for E2EE retry in Baileys v7
+- **Crypto error recovery** — Baileys crypto errors trigger reconnect instead of crash
+- **Graceful shutdown** — clean exit on SIGTERM/SIGINT/stdin close
 
 ## Requirements
 
@@ -22,24 +35,19 @@ The plugin runs as an MCP server that connects to WhatsApp via Baileys, receives
 - **Claude Code** 2.1.80+ (with Channels support)
 - **WhatsApp** account (regular or Business)
 
-## Setup
+## Quick Start
 
-### 1. Install the plugin
+### 1. Clone and install
 
 ```bash
-# Add as a local marketplace
-claude plugin marketplace add /path/to/claude-code-whatsapp
-
-# Or from GitHub
-claude plugin marketplace add github:diogo85/claude-code-whatsapp
-
-# Install
-claude plugin install whatsapp@claude-code-whatsapp
+git clone https://github.com/diogo85/claude-code-whatsapp.git
+cd claude-code-whatsapp
+npm install
 ```
 
-### 2. Configure the MCP server
+### 2. Configure MCP server
 
-Add to your project's `.mcp.json` (in the working directory where Claude Code runs):
+Add to your project's `.mcp.json`:
 
 ```json
 {
@@ -55,33 +63,27 @@ Add to your project's `.mcp.json` (in the working directory where Claude Code ru
 }
 ```
 
-### 3. Pair with WhatsApp (QR code)
+### 3. Pair with WhatsApp
 
 ```bash
-# Create state directory
 mkdir -p ~/.claude/channels/whatsapp/auth
-
-# Install dependencies
-cd /path/to/claude-code-whatsapp && npm install
-
-# Generate QR code
 WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp node pair.cjs
 ```
 
-On your phone: **WhatsApp > Settings > Linked Devices > Link a Device** — scan the QR code.
+The script shows both a **QR code** and a **pairing code**. On your phone:
+- **QR:** WhatsApp > Linked Devices > Link a Device — scan the QR
+- **Code:** WhatsApp > Linked Devices > Link a Device > Link with phone number — enter the code
 
-Keep the process running for at least 30 seconds after scanning to complete registration.
+Wait for "✅ WhatsApp connected!" before closing.
 
-### 4. Start Claude Code with WhatsApp
+### 4. Start Claude Code
 
 ```bash
 WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp \
-  claude --channels "plugin:discord@claude-plugins-official" \
-  --dangerously-load-development-channels "server:whatsapp" \
-  --dangerously-skip-permissions
+  claude --dangerously-load-development-channels "server:whatsapp"
 ```
 
-On the first run, Claude Code will ask you to confirm that you're using this for local development. Select option 1.
+On the first run, select "I am using this for local development" when prompted.
 
 ### 5. Access control (optional)
 
@@ -97,35 +99,88 @@ Create `~/.claude/channels/whatsapp/access.json`:
 ```
 
 - `allowFrom: []` (empty) = accept messages from anyone
-- `allowFrom: ["5511999999999"]` = only accept from this number
+- `allowFrom: ["5511999999999"]` = only from this number
+- `allowGroups: true` + `allowedGroups: ["xxx@g.us"]` = specific groups
 
 ## Tools
 
-The plugin exposes 4 tools to Claude:
-
 | Tool | Description |
 |------|-------------|
-| `reply` | Send a text message (with optional file attachments) |
+| `reply` | Send text + file attachments (images, audio, video, documents) |
 | `react` | Add an emoji reaction to a message |
 | `download_attachment` | Download media from a received message |
 | `fetch_messages` | List recent messages from session cache |
 
-## Important notes
+## Permission Relay
 
-- **One process at a time:** Never run two WhatsApp processes simultaneously — this causes error 440 (session conflict) and an infinite reconnection loop.
-- **Session expiry:** WhatsApp sessions expire after ~14 days of inactivity. Re-run `pair.cjs` to scan a new QR code.
-- **Development channels:** Since this is not an official Claude Code plugin, you must use `--dangerously-load-development-channels "server:whatsapp"` every time you start Claude Code.
-- **Baileys is unofficial:** [Baileys](https://github.com/WhiskeySockets/Baileys) reverse-engineers the WhatsApp Web protocol. WhatsApp may ban accounts using unofficial clients. Use at your own risk.
+When Claude Code needs permission to run a tool, it can send the request to your WhatsApp:
+
+```
+🔐 Permission request [tbxkq]
+
+Bash: rm -rf /tmp/foo
+
+Reply "yes tbxkq" or "no tbxkq"
+```
+
+Reply from your phone and Claude Code will proceed (or stop). The plugin reacts with ✅ or ❌ to confirm.
+
+Requires Claude Code v2.1.81+ and the `claude/channel/permission` capability (enabled by default in v0.0.3).
+
+## Stability Design
+
+This plugin was rewritten based on analysis of [OpenClaw's WhatsApp extension](https://github.com/openclaw/openclaw/tree/main/extensions/whatsapp), which runs 24/7 without issues. Key patterns:
+
+| Pattern | Description |
+|---------|-------------|
+| 515 = reconnect | WhatsApp sends 515 regularly. It's a normal restart request, not an error |
+| Never process.exit | Only stop on 440 (conflict) or 401 (logout). Everything else reconnects |
+| New socket each time | Never reuse a dead socket — create fresh on every reconnect |
+| Backoff with jitter | Prevents thundering herd. Reset after 60s of healthy connection |
+| Watchdog timer | 30min without inbound messages = force reconnect (detects zombie connections) |
+| Creds backup | Auto-backup before each save. Auto-restore if JSON is corrupted |
+| Listener cleanup | Remove all event listeners before creating new socket (prevents leaks) |
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| Error 440 in loop | Kill ALL node processes related to WhatsApp, wait 30s, restart |
-| "not on approved channels allowlist" | Make sure you're using `--dangerously-load-development-channels "server:whatsapp"` |
-| QR code not appearing | Delete `~/.claude/channels/whatsapp/auth/` and try again |
-| Messages not received | Check that no other process is using the same WhatsApp session |
-| "plugin not installed" | Run `claude plugin install whatsapp@claude-code-whatsapp` |
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| "WhatsApp not connected" | Auth expired or not paired | Run `pair.cjs` and scan QR |
+| Error 515 | Normal — WhatsApp requested restart | v0.0.3 handles automatically. If old version: update |
+| Error 440 | Two devices competing | Unlink in phone settings, re-pair |
+| Error 401 | Logged out | Session invalidated, re-pair |
+| Rate limit on pairing | Too many rapid attempts | Wait 1-2 hours, try ONCE |
+| Messages stop without error | Zombie connection | Watchdog (v0.0.3) detects in 30min. Or restart manually |
+| creds.json corrupted | Crash during save | v0.0.3 restores from backup automatically |
+
+## Changelog
+
+### v0.0.3 (2026-03-24)
+- **Breaking:** Rewrote connection lifecycle based on OpenClaw patterns
+- 515 treated as normal reconnect (was fatal `process.exit`)
+- Never `process.exit` in reconnect loop (only 440/401 stop)
+- Exponential backoff with jitter + reset after healthy period (60s)
+- Watchdog detects stale connections (30min timeout)
+- Credential backup/restore before each save
+- `getMessage` handler for E2EE retry (required in Baileys v7)
+- Crypto error handler (reconnect instead of crash)
+- Permission relay capability (`claude/channel/permission`)
+- `process.setMaxListeners(50)` to avoid warnings
+- Full listener cleanup before reconnecting
+
+### v0.0.2 (2026-03-23)
+- `browser` fixed to `["Mac OS", "Safari", "1.0.0"]` (valid for Baileys v7)
+- Basic exponential backoff + max retries
+- Creds save with retry
+- Permission relay (outbound + inbound)
+
+### v0.0.1 (2026-03-21)
+- Initial implementation based on OpenClaw's architecture
+- Baileys v7.0.0-rc.9
+- MCP server with channel capability
+- 4 tools: reply, react, download_attachment, fetch_messages
+- Access control via allowlist
+- Deduplication cache (20min TTL)
 
 ## License
 

@@ -1,99 +1,68 @@
 #!/usr/bin/env node
-/**
- * WhatsApp pairing utility — generates QR code for linking a device.
- *
- * Usage:
- *   WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp node pair.cjs
- *
- * After scanning, keep the process running for at least 30 seconds
- * to allow the registration to complete.
- */
-
-const {
-  makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-  DisconnectReason,
-} = require("@whiskeysockets/baileys");
-const pino = require("pino");
+// Standalone WhatsApp pairing — run from plugin dir for node_modules
+// Usage: cd ~/.claude/plugins/cache/nexus-plugins/whatsapp/0.0.1 && node ~/nexus/scripts/whatsapp-pair.cjs
+const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, fetchLatestBaileysVersion, DisconnectReason } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
-const fs = require("fs");
+const pino = require("pino");
 
-const AUTH_DIR = (process.env.WHATSAPP_STATE_DIR || "./state") + "/auth";
-const logger = pino({ level: "silent" });
+const AUTH_DIR = "/Users/stent/.claude/channels/whatsapp/auth";
 
-fs.mkdirSync(AUTH_DIR, { recursive: true });
+console.log("WhatsApp pairing — auth dir:", AUTH_DIR);
+console.log("Connecting...\n");
 
-async function start() {
+(async () => {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
-
-  console.log("Baileys version:", version);
-  console.log("Auth dir:", AUTH_DIR);
-  console.log("Waiting for QR code...\n");
+  const logger = pino({ level: "silent" });
 
   const sock = makeWASocket({
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
+    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     version,
     logger,
-    browser: ["claude-code", "whatsapp", "1.0.0"],
+    browser: ["Mac OS", "Safari", "1.0.0"],
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (u) => {
-    if (u.qr) {
-      qrcode.generate(u.qr, { small: true }, (code) => {
+  // Request pairing code (phone-based, no QR scan needed)
+  if (!state.creds.registered) {
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode("556281955400");
+        console.log(`\n📱 PAIRING CODE: ${code}\n`);
+        console.log("WhatsApp > Linked Devices > Link a Device > Link with phone number");
+        console.log("Enter the code above.\n");
+      } catch (e) {
+        console.error("Pairing code failed, waiting for QR instead...");
+      }
+    }, 3000);
+  }
+
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      qrcode.generate(qr, { small: true }, (code) => {
+        console.log("\n📱 Or scan this QR:\n");
         console.log(code);
-        console.log("^^^ Scan this QR code with WhatsApp > Linked Devices > Link a Device ^^^\n");
       });
     }
-    if (u.connection === "open") {
-      console.log("Connected! You can now send a test message.");
-      console.log("Keep this process running for at least 30 seconds to complete registration.\n");
+
+    if (connection === "open") {
+      console.log("\n✅ WhatsApp connected! Auth saved. Closing in 3s...");
+      setTimeout(() => process.exit(0), 3000);
     }
-    if (u.connection === "close") {
-      const code = u.lastDisconnect?.error?.output?.statusCode;
-      console.log("Connection closed:", code);
-      if (code === 440) {
-        console.log("Session conflict (440) — another process is using this session.");
-        console.log("Make sure no other WhatsApp process is running.");
-        return;
-      }
-      if (code === DisconnectReason.loggedOut) {
-        console.log("Logged out. Delete auth/ directory and scan QR again.");
+
+    if (connection === "close") {
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      if (reason === DisconnectReason.loggedOut || reason === 440 || reason === 515) {
+        console.log(`❌ Error ${reason}. Delete auth/ and try again after a few minutes.`);
         process.exit(1);
       }
-      console.log("Reconnecting in 3s...");
-      setTimeout(start, 3000);
+      console.log(`Connection closed (${reason}), retrying...`);
+      setTimeout(() => process.exit(1), 1000);
     }
   });
-
-  sock.ev.on("messages.upsert", (m) => {
-    for (const msg of m.messages || []) {
-      if (msg.key.fromMe) continue;
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        "(media)";
-      console.log(`Message received: "${text}" from ${msg.key.remoteJid}`);
-    }
-  });
-}
-
-start().catch((e) => {
-  console.error("Fatal:", e);
-  process.exit(1);
-});
-
-// Keep alive for 10 minutes
-setTimeout(() => {
-  console.log("Timeout — exiting.");
-  process.exit(0);
-}, 600000);
+})();
