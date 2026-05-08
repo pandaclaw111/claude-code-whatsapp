@@ -32,7 +32,8 @@ console.log("Connecting...\n");
   if (!state.creds.registered) {
     setTimeout(async () => {
       try {
-        const phone = process.env.WHATSAPP_PHONE || "17025762390";
+        const phone = process.env.WHATSAPP_PHONE;
+        if (!phone) throw new Error("Set WHATSAPP_PHONE env var to your number (e.g. 12125551234)");
         const code = await sock.requestPairingCode(phone);
         console.log(`\n📱 PAIRING CODE: ${code}\n`);
         console.log("WhatsApp > Linked Devices > Link a Device > Link with phone number");

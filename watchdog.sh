@@ -19,8 +19,9 @@ restart_whatsapp() {
   pkill -9 -f "claude-code-whatsapp/server.cjs" 2>/dev/null
   tmux kill-session -t whatsapp 2>/dev/null
   sleep 2
-  CLAUDE_BIN="/Users/pandaclaw/.nvm/versions/node/v22.22.1/bin/claude"
-  tmux new-session -d -s whatsapp "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING -u AI_AGENT WHATSAPP_STATE_DIR=$HOME/.local/share/whatsapp-channel bash -c 'source ~/.nvm/nvm.sh && cd ~ && $CLAUDE_BIN --model claude-sonnet-4-6 --dangerously-load-development-channels server:whatsapp --dangerously-skip-permissions'"
+  CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.nvm/versions/node/$(node --version 2>/dev/null | tr -d v)/bin/claude")}"
+  WHATSAPP_STATE="${WHATSAPP_STATE_DIR:-$HOME/.local/share/whatsapp-channel}"
+  tmux new-session -d -s whatsapp "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING -u AI_AGENT WHATSAPP_STATE_DIR=$WHATSAPP_STATE bash -c 'source ~/.nvm/nvm.sh && cd ~ && $CLAUDE_BIN --model claude-sonnet-4-6 --dangerously-load-development-channels server:whatsapp --dangerously-skip-permissions'"
   # Smart key-sending: check pane content and respond to the correct dialog.
   # Avoids race with keep-alive.sh which may also be sending keys.
   for i in 1 2 3 4 5; do
@@ -73,7 +74,7 @@ if echo "$PANE" | grep -qE "Do you want|Enter to confirm|Yes.*No|accept.*exit"; 
 fi
 
 IDLE_FILE="$HOME/claude-code-whatsapp/logs/.idle_count"
-if echo "$PANE" | grep -qE "Process completed|Saving session|pandaclaw.*%"; then
+if echo "$PANE" | grep -qE "Process completed|Saving session|[a-z].*%$"; then
   echo "$TS L2: Session ended. Restarting..." >> "$LOG"
   restart_whatsapp
   echo "$TS L2: Restarted." >> "$LOG"

@@ -832,7 +832,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             log(`reply OK -> ${chatId} msgId=${result?.key?.id || "?"}`);
             storeRecent(chatId, {
               id: result?.key?.id || `out-${Date.now()}`,
-              from: "pandaclaw",
+              from: sock?.user?.id || "self",
               text,
               ts: Date.now(),
               hasMedia: false,
