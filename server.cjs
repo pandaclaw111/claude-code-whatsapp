@@ -33,16 +33,65 @@ const { z } = require("zod");
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const STATE_DIR = process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".claude", "channels", "whatsapp");
+const STATE_DIR = process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".local", "share", "whatsapp-channel");
 const ACCESS_FILE = path.join(STATE_DIR, "access.json");
 const AUTH_DIR = path.join(STATE_DIR, "auth");
 const INBOX_DIR = path.join(STATE_DIR, "inbox");
+const HISTORY_FILE = path.join(STATE_DIR, "history.jsonl");
+const HISTORY_RESTORE_LINES = 500; // how many tail lines to rehydrate on boot
 
 fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(INBOX_DIR, { recursive: true });
+try { fs.chmodSync(ACCESS_FILE, 0o600); } catch {}
+
+// Singleton: PID lockfile prevents duplicate server.cjs processes (440 fight)
+const PID_FILE = path.join(STATE_DIR, "server.pid");
+(function enforceSingleton() {
+  // Pairing-priority: if pairing.in_progress flag exists and old process is alive,
+  // yield to the pairing process instead of killing it. This lets a standalone
+  // pairing server survive VS Code's auto-respawn.
+  const PAIRING_FLAG = path.join(STATE_DIR, "pairing.in_progress");
+  const pairingActive = fs.existsSync(PAIRING_FLAG);
+
+  try {
+    const oldPid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
+    if (oldPid && oldPid !== process.pid) {
+      let alive = false;
+      try { process.kill(oldPid, 0); alive = true; } catch {}
+      if (alive) {
+        if (pairingActive) {
+          process.stderr.write(`whatsapp channel: pairing in progress — yielding to pid ${oldPid}\n`);
+          process.exit(0);
+        }
+        process.stderr.write(`whatsapp channel: killing duplicate server.cjs (pid ${oldPid})\n`);
+        try { process.kill(oldPid, "SIGTERM"); } catch {}
+      }
+      // stale pid (dead process): skip kill, fall through to write new PID
+    }
+  } catch {}
+  fs.writeFileSync(PID_FILE, String(process.pid));
+})();
+process.on("exit", () => { try { if (fs.readFileSync(PID_FILE, "utf8").trim() === String(process.pid)) fs.unlinkSync(PID_FILE); } catch {} });
 
 const logger = pino({ level: "silent" });
-const log = (msg) => process.stderr.write(`whatsapp channel: ${msg}\n`);
+const LOG_FILE = path.join(STATE_DIR, "bridge.log");
+const LOG_MAX_BYTES = 2 * 1024 * 1024; // 2 MB — rotate to .old when exceeded
+function rotateLogIfNeeded() {
+  try {
+    const st = fs.statSync(LOG_FILE);
+    if (st.size > LOG_MAX_BYTES) {
+      fs.renameSync(LOG_FILE, LOG_FILE + ".old"); // keeps 1 previous generation
+    }
+  } catch {}
+}
+const log = (msg) => {
+  const line = `${new Date().toISOString()} ${msg}\n`;
+  process.stderr.write(`whatsapp channel: ${msg}\n`);
+  try {
+    rotateLogIfNeeded();
+    fs.appendFileSync(LOG_FILE, line);
+  } catch {}
+};
 
 // Permission-reply spec from claude-cli-internal channelPermissions.ts
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
@@ -56,7 +105,7 @@ const HEALTHY_THRESHOLD = 60 * 1000;     // 60s connected = healthy (reset backo
 // ── Access Control ──────────────────────────────────────────────────
 
 function defaultAccess() {
-  return { allowFrom: [], allowGroups: false, allowedGroups: [], requireAllowFromInGroups: false };
+  return { allowFrom: [], allowGroups: false, allowedGroups: [], requireAllowFromInGroups: false, readOnlyGroups: [] };
 }
 
 function loadAccess() {
@@ -93,15 +142,29 @@ function isAllowed(jid, participant) {
 // ── Path safety ─────────────────────────────────────────────────────
 
 function assertSendable(f) {
-  try {
-    const real = fs.realpathSync(f);
-    const stateReal = fs.realpathSync(STATE_DIR);
-    const inbox = path.join(stateReal, "inbox");
-    if (real.startsWith(stateReal + path.sep) && !real.startsWith(inbox + path.sep)) {
-      throw new Error(`refusing to send channel state: ${f}`);
+  // realpath throws ENOENT on missing files — intentional fail-closed
+  const real = fs.realpathSync(f);
+  const stateReal = fs.realpathSync(STATE_DIR);
+  const inbox = path.join(stateReal, "inbox");
+  // Allow inbox files; deny rest of STATE_DIR (auth/creds, history, access.json)
+  if (real.startsWith(stateReal + path.sep) && !real.startsWith(inbox + path.sep)) {
+    throw new Error(`refusing to send channel state: ${f}`);
+  }
+  // Sensitive-path deny-list (NOTE: ~/.claude intentionally NOT here — INBOX lives under it,
+  // and the STATE_DIR check above already protects auth/creds.json)
+  const home = os.homedir();
+  const DENY_DIRS = [
+    path.join(home, ".ssh"), path.join(home, ".aws"), path.join(home, ".gnupg"),
+    path.join(home, ".config"),
+    "/etc", "/private/etc",
+  ];
+  for (const d of DENY_DIRS) {
+    if (real === d || real.startsWith(d + path.sep)) {
+      throw new Error(`refusing sensitive path: ${f}`);
     }
-  } catch (e) {
-    if (e.message?.startsWith("refusing")) throw e;
+  }
+  if (/\.(pem|key)$|(^|\/)id_rsa(\.|$)|(^|\/)\.env(\.|$)|credentials\.json$/.test(real)) {
+    throw new Error(`refusing sensitive file: ${f}`);
   }
 }
 
@@ -111,6 +174,26 @@ const rawMessages = new Map();
 const RAW_MSG_CAP = 500;
 const recentMessages = new Map();
 const MAX_RECENT = 100;
+// Track messages PandaClaw sent so we ignore our own echoes in messages.upsert
+const sentMessageIds = new Set();
+const SENT_CAP = 500;
+function rememberSent(id) {
+  if (!id) return;
+  sentMessageIds.add(id);
+  if (sentMessageIds.size > SENT_CAP) {
+    const first = sentMessageIds.values().next().value;
+    sentMessageIds.delete(first);
+  }
+}
+// Linked account's own JID(s) — set when connection opens. Used as the ONLY
+// allowed chat. Messages outside this chat are refused on inbound AND outbound.
+let SELF_JID = null;
+let SELF_LID = null;
+function isSelfChat(jid) {
+  if (!jid) return false;
+  const bare = jid.replace(/:\d+/, "");
+  return (SELF_JID && bare === SELF_JID) || (SELF_LID && bare === SELF_LID);
+}
 const seenMessages = new Map();
 const SEEN_TTL = 20 * 60 * 1000;
 const SEEN_MAX = 5000;
@@ -142,6 +225,65 @@ function storeRecent(chatId, entry) {
   const arr = recentMessages.get(chatId);
   arr.push(entry);
   if (arr.length > MAX_RECENT) arr.shift();
+  appendHistory(chatId, entry);
+}
+
+// ── Persistent history (JSONL) ──────────────────────────────────────
+// Append-only log of every msg (inbound + outbound) so fetch_messages
+// works across bridge restarts. Survives process death; restored on boot.
+
+function appendHistory(chatId, entry) {
+  try {
+    const line = JSON.stringify({ chat_id: chatId, ...entry }) + "\n";
+    fs.appendFileSync(HISTORY_FILE, line);
+  } catch (e) {
+    // Don't crash the bridge on disk issues — just lose this msg from history
+    log(`history append failed: ${e?.message || e}`);
+  }
+}
+
+function readHistoryTail(maxLines) {
+  // Stream the file backwards-from-end to grab the last N JSONL lines without
+  // loading the whole file. For our scale (low thousands/day) we can just
+  // read the file and slice; revisit if it grows past ~50MB.
+  try {
+    const raw = fs.readFileSync(HISTORY_FILE, "utf8");
+    const lines = raw.split("\n").filter(Boolean);
+    return lines.slice(-maxLines).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean);
+  } catch (e) {
+    if (e.code !== "ENOENT") log(`history read failed: ${e?.message || e}`);
+    return [];
+  }
+}
+
+function searchHistory(chatId, { query, since, limit }) {
+  const all = readHistoryTail(50000); // upper bound for in-process scan
+  const sinceTs = since ? Date.parse(since) : 0;
+  const q = query ? query.toLowerCase() : null;
+  const matches = all.filter((e) => {
+    if (chatId && e.chat_id !== chatId) return false;
+    if (sinceTs && e.ts < sinceTs) return false;
+    if (q && !(e.text || "").toLowerCase().includes(q)) return false;
+    return true;
+  });
+  return matches.slice(-limit);
+}
+
+function restoreRecentFromHistory() {
+  const entries = readHistoryTail(HISTORY_RESTORE_LINES);
+  let restored = 0;
+  for (const e of entries) {
+    const { chat_id, ...rest } = e;
+    if (!chat_id) continue;
+    if (!recentMessages.has(chat_id)) recentMessages.set(chat_id, []);
+    const arr = recentMessages.get(chat_id);
+    arr.push(rest);
+    if (arr.length > MAX_RECENT) arr.shift();
+    restored++;
+  }
+  if (restored) log(`restored ${restored} msgs from history.jsonl`);
 }
 
 // ── Creds backup/restore (like OpenClaw) ────────────────────────────
@@ -149,14 +291,20 @@ function storeRecent(chatId, entry) {
 function maybeRestoreCredsFromBackup() {
   const credsPath = path.join(AUTH_DIR, "creds.json");
   const backupPath = path.join(AUTH_DIR, "creds.json.bak");
+  let needsRestore = false;
   try {
     const raw = fs.readFileSync(credsPath, "utf8");
-    JSON.parse(raw); // validate
-    return; // creds valid
-  } catch {}
+    const creds = JSON.parse(raw);
+    if (creds.me) return; // creds valid with identity
+    needsRestore = true; // creds exist but no identity — try backup
+  } catch {
+    needsRestore = true; // creds missing or corrupt
+  }
+  if (!needsRestore) return;
   try {
     const backup = fs.readFileSync(backupPath, "utf8");
-    JSON.parse(backup); // validate backup
+    const backupCreds = JSON.parse(backup);
+    if (!backupCreds.me) return; // backup also has no identity, skip
     fs.copyFileSync(backupPath, credsPath);
     try { fs.chmodSync(credsPath, 0o600); } catch {}
     log("restored creds.json from backup");
@@ -218,6 +366,8 @@ function cleanupSocket() {
 async function connectWhatsApp() {
   // Cleanup previous socket completely (like OpenClaw — new socket each time)
   cleanupSocket();
+  // Reset stale-message timer so watchdog doesn't immediately re-trigger
+  lastInboundAt = 0;
 
   // Restore creds from backup if corrupted
   maybeRestoreCredsFromBackup();
@@ -247,6 +397,9 @@ async function connectWhatsApp() {
 
   sock.ev.on("creds.update", enqueueSaveCreds);
 
+  const _needsPairing = !authState.state.creds.registered;
+  let _pairingRequested = false;
+
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -261,16 +414,49 @@ async function connectWhatsApp() {
       connectionReady = false;
       const reason = lastDisconnect?.error?.output?.statusCode;
 
-      // 440 = session conflict — another device replaced. Stop permanently.
-      if (reason === 440) {
-        log("session conflict (440) — another device replaced this connection. Re-link required.");
-        return; // stop, don't reconnect
+      // 408 = QR/pairing session timeout. During initial pairing, DON'T
+      // reconnect — creds must stay unchanged until user enters the code.
+      // The phone code stays valid for the full 5-minute pairing window even
+      // after 408. Reconnecting would generate new keys and invalidate the code.
+      if (reason === 408 && !authState?.state?.creds?.registered) {
+        log("408 timeout during initial pairing — keeping creds stable, retrying in 10s...");
+        setTimeout(connectWhatsApp, 10000);
+        return;
       }
 
-      // 401 = logged out — creds invalidated
+      // 440 = session conflict — another device replaced. Transient; retry
+      // with backoff so we regain the link when the other device drops.
+      // (Previous behaviour: give up permanently — that caused zombie bridge
+      // states where MCP was alive but Baileys stayed disconnected.)
+      if (reason === 440) {
+        log("session conflict (440) — another device took over. Retrying in 30s...");
+        setTimeout(connectWhatsApp, 30000);
+        return;
+      }
+
+      // 401 = logged out — creds invalidated.
+      // Always try backup first. If backup has a valid identity, restore and retry.
+      // Only delete creds (force re-pair) if backup also has no identity.
       if (reason === DisconnectReason.loggedOut) {
-        log("logged out (401) — session invalidated. Re-pair needed.");
-        return; // stop, don't reconnect (user must re-pair)
+        const credsPath = path.join(AUTH_DIR, "creds.json");
+        const backupPath = path.join(AUTH_DIR, "creds.json.bak");
+        let restoredBackup = false;
+        try {
+          const backupRaw = fs.readFileSync(backupPath, "utf8");
+          const backupCreds = JSON.parse(backupRaw);
+          if (backupCreds.me) {
+            fs.copyFileSync(backupPath, credsPath);
+            try { fs.chmodSync(credsPath, 0o600); } catch {}
+            log("401 logged out — restored backup creds, retrying in 5s...");
+            restoredBackup = true;
+          }
+        } catch {}
+        if (!restoredBackup) {
+          log("401 logged out — no usable backup, clearing creds for re-pair in 5s...");
+          try { fs.rmSync(credsPath); } catch {}
+        }
+        setTimeout(connectWhatsApp, 5000);
+        return;
       }
 
       // 515 = restart requested by WhatsApp — NORMAL event, reconnect quickly
@@ -303,7 +489,13 @@ async function connectWhatsApp() {
       connectionReady = true;
       connectedAt = Date.now();
       retryCount = 0;
-      log("connected");
+      // Capture the linked account's own JID so we can lock the bridge to the
+      // self-chat (Message-Yourself) only.
+      const meId = sock?.user?.id;
+      const meLid = sock?.user?.lid;
+      if (meId) SELF_JID = meId.replace(/:\d+/, "");
+      if (meLid) SELF_LID = meLid.replace(/:\d+/, "");
+      log(`connected as ${SELF_JID || "?"} (lid=${SELF_LID || "?"})`);
 
       // Start watchdog — detect stale connections
       if (watchdogTimer) clearInterval(watchdogTimer);
@@ -323,25 +515,55 @@ async function connectWhatsApp() {
   }
 
   // Message handler
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    log(`upsert: ${messages.length} msgs, SELF_JID=${SELF_JID}`);
     for (const msg of messages) {
-      if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
+      const jid = msg.key?.remoteJid || "?";
+      if (!msg.message) { log(`upsert skip no-payload jid=${jid} id=${msg.key?.id}`); continue; }
 
-      const jid = msg.key.remoteJid;
-      if (!jid) continue;
-      if (jid.endsWith("@broadcast") || jid.endsWith("@status")) continue;
+      // Ignore echoes of PandaClaw's own replies
+      if (msg.key.id && sentMessageIds.has(msg.key.id)) { log(`upsert skip echo id=${msg.key.id}`); continue; }
+
+      if (!jid || jid === "?") continue;
+      if (jid.endsWith("@broadcast") || jid.endsWith("@status")) { log(`upsert skip broadcast/status jid=${jid}`); continue; }
+
+      // SELF-CHAT LOCK: only process messages in Ben's Message-Yourself chat.
+      // Anything else (random contacts, groups) is refused — PandaClaw is
+      // deliberately not a general responder. This replaces the access.json
+      // allowlist for inbound filtering: the self-chat JID IS the allowlist.
+      //
+      // Exception: readOnlyGroups in access.json are logged to history but
+      // never trigger Claude (no MCP notification sent).
+      const readOnlyGroups = loadAccess().readOnlyGroups || [];
+      const isReadOnly = readOnlyGroups.includes(jid);
+      if (!isSelfChat(jid) && !isReadOnly) { log(`upsert skip non-self jid=${jid}`); continue; }
 
       const msgId = msg.key.id;
       const participant = msg.key.participant;
 
       if (msgId && isDuplicate(`${jid}:${msgId}`)) continue;
-      if (!isAllowed(jid, participant || undefined)) continue;
 
       try { await sock.readMessages([msg.key]); } catch {}
 
       lastInboundAt = Date.now();
       storeRaw(msg);
+
+      if (isReadOnly) {
+        // Log to history for /metacrisis and similar skills, but don't trigger Claude
+        const text = extractText(msg.message) || "";
+        const media = extractMediaInfo(msg.message);
+        if (text || media) {
+          storeRecent(jid, {
+            id: msgId, from: formatJid(participant || jid),
+            text: text || `(${media.type})`,
+            ts: (Number(msg.messageTimestamp) || Date.now() / 1000) * 1000,
+            hasMedia: !!media, mediaType: media?.type,
+          });
+        }
+        log(`read-only group ${jid}: stored, not triggering`);
+        continue;
+      }
+
       await handleInbound(msg, jid, participant || undefined);
     }
   });
@@ -349,7 +571,39 @@ async function connectWhatsApp() {
 
 // ── Message helpers ─────────────────────────────────────────────────
 
+function unwrapMessage(msg) {
+  // Unwrap container types recursively (max 5 levels — pathological nesting guard)
+  let depth = 0;
+  while (msg && depth++ < 5) {
+    // Multi-device self-send sync: when Ben sends from his phone, linked Baileys
+    // receives a deviceSentMessage wrapper. The real payload is inside .message.
+    if (msg.deviceSentMessage?.message) { msg = msg.deviceSentMessage.message; continue; }
+    if (msg.ephemeralMessage?.message) { msg = msg.ephemeralMessage.message; continue; }
+    if (msg.viewOnceMessage?.message) { msg = msg.viewOnceMessage.message; continue; }
+    if (msg.viewOnceMessageV2?.message) { msg = msg.viewOnceMessageV2.message; continue; }
+    if (msg.viewOnceMessageV2Extension?.message) { msg = msg.viewOnceMessageV2Extension.message; continue; }
+    if (msg.documentWithCaptionMessage?.message) { msg = msg.documentWithCaptionMessage.message; continue; }
+    // editedMessage (Baileys v7): msg.editedMessage.message.protocolMessage.editedMessage
+    if (msg.editedMessage?.message?.protocolMessage?.editedMessage) {
+      msg = msg.editedMessage.message.protocolMessage.editedMessage;
+      continue;
+    }
+    break;
+  }
+  return msg || {};
+}
+
+function isSystemMessage(msg) {
+  // protocol/reaction/poll updates are handled elsewhere or carry no user-visible content
+  if (msg.protocolMessage) return true;
+  if (msg.reactionMessage) return true;
+  if (msg.pollUpdateMessage) return true;
+  if (msg.senderKeyDistributionMessage && Object.keys(msg).length === 1) return true;
+  return false;
+}
+
 function extractText(msg) {
+  msg = unwrapMessage(msg);
   return (
     msg.conversation ||
     msg.extendedTextMessage?.text ||
@@ -361,6 +615,7 @@ function extractText(msg) {
 }
 
 function extractMediaInfo(msg) {
+  msg = unwrapMessage(msg);
   if (msg.imageMessage) return { type: "image", mimetype: msg.imageMessage.mimetype || "image/jpeg", size: Number(msg.imageMessage.fileLength) || 0 };
   if (msg.videoMessage) return { type: "video", mimetype: msg.videoMessage.mimetype || "video/mp4", size: Number(msg.videoMessage.fileLength) || 0 };
   if (msg.audioMessage) return { type: "audio", mimetype: msg.audioMessage.mimetype || "audio/ogg", size: Number(msg.audioMessage.fileLength) || 0 };
@@ -386,6 +641,14 @@ function formatJid(jid) {
 
 async function handleInbound(msg, jid, participant) {
   const message = msg.message;
+
+  // Drop system / protocol messages (reactions, edits-in-transit, poll updates, etc.)
+  // Check on the UNWRAPPED payload so ephemeral-wrapped protocol messages are caught too.
+  if (isSystemMessage(unwrapMessage(message))) {
+    log(`skip system message from ${jid}`);
+    return;
+  }
+
   const text = extractText(message);
   const media = extractMediaInfo(message);
   const msgId = msg.key.id || `${Date.now()}`;
@@ -414,16 +677,26 @@ async function handleInbound(msg, jid, participant) {
     return;
   }
 
-  const content = text || (media ? `(${media.type})` : "(empty)");
+  // Drop if there is no user-visible content — prevents "(empty)" spam from
+  // unrecognised message types (reactions, protocol frames, edit frames).
+  if (!text && !media) {
+    log(`skip empty message from ${jid} (types=${Object.keys(message || {}).join(",")})`);
+    return;
+  }
+  // Escape XML-special chars to prevent attacker-authored text (in messages Ben
+  // forwards to self-chat) from spoofing channel/system-reminder boundaries in
+  // Claude's MCP context. Order matters: & first, then < and >.
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const content = esc(text || `(${media.type})`);
   const meta = {
-    chat_id: jid, message_id: msgId, user: senderNumber,
+    chat_id: esc(jid), message_id: esc(msgId), user: esc(senderNumber),
     ts: new Date((Number(msg.messageTimestamp) || Date.now() / 1000) * 1000).toISOString(),
   };
   if (media) {
     const kb = (media.size / 1024).toFixed(0);
     const name = media.filename || `${media.type}.${mimeToExt(media.mimetype)}`;
     meta.attachment_count = "1";
-    meta.attachments = `${name} (${media.mimetype}, ${kb}KB)`;
+    meta.attachments = esc(`${name} (${media.mimetype}, ${kb}KB)`);
   }
   if (isGroup) meta.group = "true";
 
@@ -514,10 +787,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "fetch_messages",
-      description: "Fetch recent messages from a WhatsApp chat (session cache only).",
+      description: "Fetch WhatsApp messages from this chat across bridge restarts. Persisted to JSONL on disk. Use this whenever the user references prior context you don't have — it's cheap and authoritative. Optional `query` (substring filter) and `since` (ISO date) for searching older history.",
       inputSchema: {
         type: "object",
-        properties: { chat_id: { type: "string" }, limit: { type: "number" } },
+        properties: {
+          chat_id: { type: "string" },
+          limit: { type: "number", description: "Max messages to return (default 20, max 200)" },
+          query: { type: "string", description: "Optional case-insensitive substring filter on message text" },
+          since: { type: "string", description: "Optional ISO date — only return messages after this timestamp" },
+        },
         required: ["chat_id"],
       },
     },
@@ -531,15 +809,39 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     switch (req.params.name) {
       case "reply": {
-        const chatId = args.chat_id;
+        let chatId = args.chat_id;
         const text = args.text;
         const files = args.files || [];
+        // SELF-CHAT LOCK: ignore caller's chat_id if it isn't the self-chat.
+        // Transparently redirect all replies to Ben's Message-Yourself chat so
+        // mis-addressed replies can never leak to third parties.
+        if (!isSelfChat(chatId) && SELF_JID) {
+          log(`reply REROUTED: caller asked ${chatId} → forced to ${SELF_JID}`);
+          chatId = SELF_JID;
+        }
         for (const f of files) {
           assertSendable(f);
           if (fs.statSync(f).size > 64 * 1024 * 1024) throw new Error(`file too large: ${f}`);
         }
         const quoted = args.reply_to ? rawMessages.get(args.reply_to) : undefined;
-        if (text) await sock.sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
+        if (text) {
+          log(`reply -> ${chatId} (${text.length} chars)`);
+          try {
+            const result = await sock.sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
+            rememberSent(result?.key?.id);
+            log(`reply OK -> ${chatId} msgId=${result?.key?.id || "?"}`);
+            storeRecent(chatId, {
+              id: result?.key?.id || `out-${Date.now()}`,
+              from: "pandaclaw",
+              text,
+              ts: Date.now(),
+              hasMedia: false,
+            });
+          } catch (e) {
+            log(`reply FAILED -> ${chatId}: ${e?.message || e}`);
+            throw e;
+          }
+        }
         for (const f of files) {
           const ext = path.extname(f).toLowerCase();
           const buf = fs.readFileSync(f);
@@ -556,9 +858,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: "text", text: "sent" }] };
       }
       case "react": {
-        await sock.sendMessage(args.chat_id, {
-          react: { text: args.emoji, key: { remoteJid: args.chat_id, id: args.message_id } },
+        let chatId = args.chat_id;
+        if (!isSelfChat(chatId) && SELF_JID) {
+          log(`react BLOCKED: caller asked ${chatId}, only self-chat allowed`);
+          return { content: [{ type: "text", text: "refused: only self-chat reactions allowed" }] };
+        }
+        const result = await sock.sendMessage(chatId, {
+          react: { text: args.emoji, key: { remoteJid: chatId, id: args.message_id } },
         });
+        rememberSent(result?.key?.id);
         return { content: [{ type: "text", text: "reacted" }] };
       }
       case "download_attachment": {
@@ -568,16 +876,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!media) return { content: [{ type: "text", text: "message has no attachments" }] };
         const buffer = await downloadMediaMessage(raw, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
         const ext = mimeToExt(media.mimetype);
-        const filename = media.filename || `${Date.now()}.${ext}`;
-        const filePath = path.join(INBOX_DIR, `${Date.now()}-${filename}`);
+        const rawName = String(media.filename || `${Date.now()}.${ext}`);
+        const safeName = path.basename(rawName.replace(/\\/g, "/"))
+          .replace(/\0/g, "")
+          .replace(/[\x00-\x1f]/g, "_")
+          .slice(0, 200) || `file.${ext}`;
+        if (safeName === "." || safeName === "..") throw new Error("invalid filename");
+        const realInbox = fs.realpathSync(INBOX_DIR);
+        const filePath = path.join(realInbox, `${Date.now()}-${safeName}`);
+        if (!filePath.startsWith(realInbox + path.sep)) throw new Error("path escape");
         fs.writeFileSync(filePath, buffer);
         return { content: [{ type: "text", text: `downloaded: ${filePath} (${media.type}, ${(buffer.length / 1024).toFixed(0)}KB)` }] };
       }
       case "fetch_messages": {
-        const limit = Math.min(args.limit || 20, 100);
-        const msgs = recentMessages.get(args.chat_id) || [];
-        const slice = msgs.slice(-limit);
-        if (slice.length === 0) return { content: [{ type: "text", text: "(no messages in session cache)" }] };
+        const limit = Math.min(args.limit || 20, 200);
+        const { query, since } = args;
+        // If no filters, prefer the in-memory cache (fast). Otherwise scan the
+        // persisted JSONL on disk for full history.
+        const useDisk = !!(query || since) || (recentMessages.get(args.chat_id) || []).length < limit;
+        const slice = useDisk
+          ? searchHistory(args.chat_id, { query, since, limit })
+          : (recentMessages.get(args.chat_id) || []).slice(-limit);
+        if (slice.length === 0) {
+          const filterDesc = query || since ? ` matching ${query ? `query="${query}"` : ""}${query && since ? " " : ""}${since ? `since=${since}` : ""}` : "";
+          return { content: [{ type: "text", text: `(no messages found${filterDesc})` }] };
+        }
         const out = slice.map((m) => `[${new Date(m.ts).toISOString()}] ${m.from}: ${m.text}  (id: ${m.id}${m.hasMedia ? ` +${m.mediaType}` : ""})`).join("\n");
         return { content: [{ type: "text", text: out }] };
       }
@@ -626,6 +949,7 @@ process.on("SIGINT", shutdown);
 
 async function main() {
   await mcp.connect(new StdioServerTransport());
+  restoreRecentFromHistory();
   connectWhatsApp();
 }
 

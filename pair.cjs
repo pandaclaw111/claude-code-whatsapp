@@ -5,7 +5,9 @@ const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStor
 const qrcode = require("qrcode-terminal");
 const pino = require("pino");
 
-const AUTH_DIR = "/Users/stent/.claude/channels/whatsapp/auth";
+const AUTH_DIR = process.env.WHATSAPP_STATE_DIR
+  ? require("path").join(process.env.WHATSAPP_STATE_DIR, "auth")
+  : require("path").join(require("os").homedir(), ".claude/channels/whatsapp/auth");
 
 console.log("WhatsApp pairing — auth dir:", AUTH_DIR);
 console.log("Connecting...\n");
@@ -30,7 +32,8 @@ console.log("Connecting...\n");
   if (!state.creds.registered) {
     setTimeout(async () => {
       try {
-        const code = await sock.requestPairingCode("556281955400");
+        const phone = process.env.WHATSAPP_PHONE || "17025762390";
+        const code = await sock.requestPairingCode(phone);
         console.log(`\n📱 PAIRING CODE: ${code}\n`);
         console.log("WhatsApp > Linked Devices > Link a Device > Link with phone number");
         console.log("Enter the code above.\n");
