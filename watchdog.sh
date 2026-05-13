@@ -93,24 +93,62 @@ if echo "$PANE" | grep -qE "Process completed|Saving session|[a-z].*%$"; then
 fi
 
 # LAYER 3 — Stuck thinking detection
-# Present-tense Claude verbs = actively running. Past-tense (Cooked, Baked, Crunched, Cogitated) = finished
-# but not necessarily idle — could be stuck. Track consecutive "busy" ticks and interrupt after 5 min.
+# Canonical busy signal: "esc to interrupt" appears in the footer ONLY when Claude is actively
+# running. Avoids whack-a-mole verb matching (Crunching, Cooking, Drizzling, Fiddle-faddling, …)
+# which false-positives on the same words appearing in reply text in scrollback.
+# After 15 min of continuous busy: send Escape. After 25 min: kill+restart.
+# Critically, falls through to L4a/L4b — busy state alone doesn't prove healthy.
 BUSY_FILE="$HOME/claude-code-whatsapp/logs/.busy_count"
-if echo "$PANE" | grep -qE "Spinning|Wibbling|Ruminating|Crunching|Cooking|Baking|Brewing|Pondering|Cogitating|Forging|thinking"; then
+if echo "$PANE" | grep -q "esc to interrupt"; then
   BUSY=$(cat "$BUSY_FILE" 2>/dev/null || echo 0)
   BUSY=$((BUSY + 1))
   echo "$BUSY" > "$BUSY_FILE"
-  if [ "$BUSY" -ge 5 ]; then
-    echo "$TS L3: Claude stuck thinking for ${BUSY}+ min. Interrupting..." >> "$LOG"
-    tmux send-keys -t whatsapp Escape
-    sleep 2
+  if [ "$BUSY" -ge 25 ]; then
+    echo "$TS L3: Claude busy ${BUSY}+ min after escape. Kill+restart." >> "$LOG"
     echo "0" > "$BUSY_FILE"
+    restart_whatsapp
+    echo "$TS L3: Restarted." >> "$LOG"
     exit 0
+  elif [ "$BUSY" -eq 15 ]; then
+    echo "$TS L3: Claude busy 15min. Sending Escape..." >> "$LOG"
+    tmux send-keys -t whatsapp Escape
+    exit 0
+  else
+    echo "$TS L3: Claude busy (${BUSY}/15 ticks)" >> "$LOG"
+    # Fall through — reply-gap check is more authoritative
   fi
-  echo "$TS L3: Claude busy (${BUSY}/5 ticks)" >> "$LOG"
-  exit 0
+else
+  echo "0" > "$BUSY_FILE" 2>/dev/null
 fi
-echo "0" > "$BUSY_FILE" 2>/dev/null
+
+# LAYER 3b — Stuck queued input (idle but message in input box not submitted)
+# Failure mode: channel injects msg into input box but never sends Enter.
+# Detection: pane idle (no "esc to interrupt"), and input box line "❯ X" has non-placeholder content.
+# Submit by sending Enter. Placeholder is "❯ Try \"...\"" or empty after ❯ .
+QUEUED_FILE="$HOME/claude-code-whatsapp/logs/.queued_count"
+if ! echo "$PANE" | grep -q "esc to interrupt"; then
+  # Extract the LAST "❯<separator><content>" line. Claude Code uses a non-breaking space
+  # (U+00A0, bytes \xc2\xa0) after the ❯ glyph, NOT a regular space — so we match ^❯ (no space)
+  # and strip the ❯ + any whitespace bytes including NBSP.
+  INPUT_LINE=$(echo "$PANE" | grep '^❯' | tail -1 | sed $'s/^❯[\xc2\xa0[:space:]]*//')
+  # skip if empty, or starts with Try "..." (placeholder), or starts with /help-like single-token suggestion
+  if [ -n "$INPUT_LINE" ] && ! echo "$INPUT_LINE" | grep -qE '^Try "'; then
+    QC=$(cat "$QUEUED_FILE" 2>/dev/null || echo 0)
+    QC=$((QC + 1))
+    echo "$QC" > "$QUEUED_FILE"
+    if [ "$QC" -ge 2 ]; then
+      # confirmed stuck across 2 ticks — submit
+      echo "$TS L3b: Queued input stuck (\"$(echo "$INPUT_LINE" | cut -c1-40)\"). Sending Enter..." >> "$LOG"
+      tmux send-keys -t whatsapp Enter
+      echo "0" > "$QUEUED_FILE"
+      sleep 2
+      exit 0
+    fi
+    echo "$TS L3b: queued input tick ${QC}/2" >> "$LOG"
+  else
+    echo "0" > "$QUEUED_FILE" 2>/dev/null
+  fi
+fi
 
 # LAYER 4a — Context-limit / compaction stuck detection
 # When Claude hits context limit it shows "Context limit reached · /compact or /clear".

@@ -29,8 +29,9 @@ fi
 
 PANE=$(tmux capture-pane -t whatsapp -p 2>/dev/null)
 
-# Skip if Claude is mid-reply (avoid interrupting work)
-if echo "$PANE" | grep -qE "Spinning|Wibbling|Ruminating|Crunching|Cooking|Baking|Brewing|Pondering|Cogitating|Forging|Compacting|thinking"; then
+# Skip if Claude is mid-reply (avoid interrupting work).
+# Canonical busy signal: "esc to interrupt" appears only when actively running.
+if echo "$PANE" | grep -q "esc to interrupt"; then
   echo "$TS skip — Claude is busy" >> "$LOG"
   exit 0
 fi
